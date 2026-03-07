@@ -17,7 +17,7 @@ except ImportError:
     HAS_AI_LIB = False
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="祐德牙醫排班系統 v16.3 (完美雙層日曆)", layout="wide", page_icon="🦷")
+st.set_page_config(page_title="祐德牙醫排班系統 v16.3 (完美雙層乾淨版)", layout="wide", page_icon="🦷")
 CONFIG_FILE = 'yude_config_v11.json'
 
 # --- 1. 核心資料結構 ---
@@ -128,34 +128,17 @@ def generate_month_dates(year, month):
     dates = []
     for d in range(1, num_days + 1):
         dt = date(year, month, d)
-        if dt.weekday() == 6: continue 
+        if dt.weekday() == 6: continue # 略過星期日
         dates.append(dt)
     return dates
 
 def get_workdays_count(year, month):
     return len(generate_month_dates(year, month))
 
-def get_full_weeks(year, month):
-    first_day = date(year, month, 1)
-    start_date = first_day - timedelta(days=first_day.weekday()) 
-    last_day = date(year, month, calendar.monthrange(year, month)[1])
-    
-    weeks = []
-    current_date = start_date
-    while current_date <= last_day or current_date.weekday() != 0:
-        if current_date > last_day and current_date.weekday() == 0: break
-        week_dates = []
-        for _ in range(7):
-            if current_date.weekday() != 6: week_dates.append(current_date)
-            current_date += timedelta(days=1)
-        weeks.append(week_dates)
-    return weeks
-
 def parse_slot_string(text, is_fixed=False):
     wd_map = {"一":0, "二":1, "三":2, "四":3, "五":4, "六":5}
     shift_map = {"早":"早", "午":"午", "晚":"晚"}
     role_map = {"櫃":"counter", "流":"floater", "看":"look", "跟":"doctor"}
-    
     if not text: return {} if is_fixed else set()
     items = [x.strip() for x in text.replace("、", ",").split(",") if x.strip()]
     if is_fixed:
@@ -172,6 +155,17 @@ def parse_slot_string(text, is_fixed=False):
             wd = wd_map.get(item[0]); sh = shift_map.get(item[1])
             if wd is not None and sh is not None: res.add((wd, sh))
         return res
+
+def call_ai_parse_leaves(api_key, text, year, month):
+    if not HAS_AI_LIB or not api_key: return []
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"""解析休假文字。{year}年{month}月。文字：{text}
+        回傳 JSON Array: [{{"name": "小瑜", "date": "{year}-04-01", "shifts": ["早","午","晚"]}}]"""
+        res = model.generate_content(prompt)
+        return json.loads(res.text.replace("```json","").replace("```","").strip())
+    except: return []
 
 # --- 3. 核心排班演算法 ---
 
@@ -201,7 +195,8 @@ def run_auto_schedule(manual_schedule, leaves, pairing_matrix, adv_rules, ctr_co
             p_targets[nm] = lim
     if "又嘉" in p_targets: p_targets["又嘉"] = max(0, std_max - 3)
 
-    p_counts = {a["name"]: 0 for a in assts}; p_daily = {a["name"]: {} for a in assts} 
+    p_counts = {a["name"]: 0 for a in assts}
+    p_daily = {a["name"]: {} for a in assts} 
     
     shift_order = {"早": 1, "午": 2, "晚": 3}
     slots = sorted(list(set([f"{x['Date']}_{x['Shift']}" for x in manual_schedule])), 
@@ -253,8 +248,8 @@ def run_auto_schedule(manual_schedule, leaves, pairing_matrix, adv_rules, ctr_co
             
             s_lim = rule.get("shift_limit", "無限制")
             if s_lim == "僅早班" and sh != "早": return False
-            if s_lim == "僅午班" and sh != "午": return False
-            if s_lim == "僅晚班" and sh != "晚": return False
+            if s_lim == "午班" and sh != "午": return False
+            if s_lim == "晚班" and sh != "晚": return False
             
             s_wl_str = rule.get("slot_whitelist", "")
             if s_wl_str:
@@ -270,7 +265,6 @@ def run_auto_schedule(manual_schedule, leaves, pairing_matrix, adv_rules, ctr_co
             today = p_daily[name].get(dt_str, set())
             
             if sh == "晚" and "早" in today and "午" not in today: return False 
-            
             if sh == "晚" and "早" in today and "午" in today:
                 curr_dt = datetime.strptime(dt_str, "%Y-%m-%d").date()
                 yesterday_str = str(curr_dt - timedelta(days=1))
@@ -368,32 +362,37 @@ def to_excel_master(schedule_result, year, month, docs, assts):
     fmt_base = {'align': 'center', 'valign': 'vcenter', 'border': 1}
     fmt_header = workbook.add_format({**fmt_base, 'bold': True, 'bg_color': '#E0E0E0'})
     sheet = workbook.add_worksheet("總班表")
-    dates = generate_month_dates(year, month); weeks = {}; shifts = ["早", "午", "晚"]
-    for dt in dates:
-        iso = dt.isocalendar()[1]
-        if iso not in weeks: weeks[iso] = []
-        weeks[iso].append(dt)
+    
+    dates = generate_month_dates(year, month)
+    weeks_dict = collections.defaultdict(list)
+    for dt in dates: weeks_dict[dt.isocalendar()[1]].append(dt)
+    
     current_row = 0
-    for wk_idx, (iso, week_dates) in enumerate(weeks.items()):
+    shifts = ["早", "午", "晚"]
+    
+    for wk_idx, w_dates in enumerate(weeks_dict.values()):
         bg = bg_w1 if wk_idx % 2 == 0 else bg_w2
         fmt_wk = workbook.add_format({**fmt_base, 'bg_color': bg})
         fmt_wk_bold = workbook.add_format({**fmt_base, 'bg_color': bg, 'bold': True})
+        
         sheet.write(current_row, 0, f"第 {wk_idx+1} 週", fmt_header)
         col = 1
-        for dt in week_dates:
+        for dt in w_dates:
             sheet.merge_range(current_row, col, current_row, col+2, f"{dt.month}/{dt.day} ({['一','二','三','四','五','六'][dt.weekday()]})", fmt_header)
             col += 3
         current_row += 1
+        
         sheet.write(current_row, 0, "時段", fmt_header)
         col = 1
-        for dt in week_dates:
+        for dt in w_dates:
             for s in shifts:
                 sheet.write(current_row, col, s, fmt_wk_bold); col += 1
         current_row += 1
+        
         for doc in docs:
             sheet.write(current_row, 0, doc["nick"], fmt_wk_bold)
             col = 1
-            for dt in week_dates:
+            for dt in w_dates:
                 for s in shifts:
                     k = f"{dt}_{s}"; v = ""
                     if k in schedule_result:
@@ -402,11 +401,12 @@ def to_excel_master(schedule_result, year, month, docs, assts):
                             if a["name"]==v: v=a["nick"]; break
                     sheet.write(current_row, col, v, fmt_wk); col += 1
             current_row += 1
+            
         roles = [("櫃台1", "counter", 0), ("櫃台2", "counter", 1), ("流動", "floater", 0), ("看", "look", 0)]
         for rname, rkey, ridx in roles:
             sheet.write(current_row, 0, rname, fmt_wk_bold)
             col = 1
-            for dt in week_dates:
+            for dt in w_dates:
                 for s in shifts:
                     k = f"{dt}_{s}"; v = ""
                     if k in schedule_result:
@@ -419,6 +419,7 @@ def to_excel_master(schedule_result, year, month, docs, assts):
                     sheet.write(current_row, col, v, fmt_wk); col += 1
             current_row += 1
         current_row += 1
+        
     ws_stat = workbook.add_worksheet("統計")
     ws_stat.write_row(0, 0, ["助理", "上限", "實排"], fmt_header)
     cnts = {a["name"]: 0 for a in assts}
@@ -448,7 +449,8 @@ def to_excel_individual(schedule_result, year, month, assts, docs):
     b_min, b_max = calculate_shift_limits(year, month)
     note = "註：全診及午晚班有空請輪流抽空吃飯，謹守30分鐘規定。\n1〉早午班 8:30-12:00 13:30-18:00\n2〉午晚班 13:30-22:00\n3〉早晚班 08:00-12:00 18:00-22:00"
     for a in assts:
-        s = workbook.add_worksheet(a["nick"]); aname = a["name"]; act = 0
+        s = workbook.add_worksheet(a["nick"])
+        aname = a["name"]; act = 0
         for k, v in schedule_result.items():
             ppl = list(v["doctors"].values()) + v["counter"] + v["floater"] + v.get("look",[])
             if aname in ppl: act += 1
@@ -486,22 +488,21 @@ def to_excel_doctor_personal(schedule_result, year, month, docs, assts):
     workbook = writer.book
     fmt_h = workbook.add_format({'bold': True, 'align': 'center', 'bg_color': '#E0E0E0', 'border': 1})
     fmt_c = workbook.add_format({'align': 'center', 'border': 1})
-    dates = generate_month_dates(year, month); weeks = {}
-    for dt in dates:
-        iso = dt.isocalendar()[1]
-        if iso not in weeks: weeks[iso] = []
-        weeks[iso].append(dt)
+    dates = generate_month_dates(year, month)
+    weeks_dict = collections.defaultdict(list)
+    for dt in dates: weeks_dict[dt.isocalendar()[1]].append(dt)
+    
     for doc in docs:
         s = workbook.add_worksheet(doc["nick"]); dn = doc["name"]
         s.write(0, 0, f"{dn} - {month}月", fmt_h)
         cr = 1
-        for iso, wds in weeks.items():
+        for w_dates in weeks_dict.values():
             s.write(cr, 0, "日期", fmt_h); c = 1
-            for dt in wds: s.write(cr, c, f"{dt.month}/{dt.day}", fmt_h); c+=1
+            for dt in w_dates: s.write(cr, c, f"{dt.month}/{dt.day}", fmt_h); c+=1
             cr+=1
             for sh in ["早", "午", "晚"]:
                 s.write(cr, 0, sh, fmt_c); c = 1
-                for dt in wds:
+                for dt in w_dates:
                     k = f"{dt}_{sh}"; v = "" 
                     if k in schedule_result:
                         if dn in schedule_result[k]["doctors"]:
@@ -510,6 +511,35 @@ def to_excel_doctor_personal(schedule_result, year, month, docs, assts):
                     s.write(cr, c, v, fmt_c); c+=1
                 cr+=1
             cr+=1
+    writer.close()
+    output.seek(0)
+    return output
+
+def to_excel_single_doctor(schedule_result, year, month, dname, dnick):
+    output = io.BytesIO()
+    writer = pd.ExcelWriter(output, engine='xlsxwriter')
+    workbook = writer.book
+    fmt_h = workbook.add_format({'bold': True, 'align': 'center', 'bg_color': '#E0E0E0', 'border': 1})
+    fmt_c = workbook.add_format({'align': 'center', 'border': 1})
+    dates = generate_month_dates(year, month)
+    weeks_dict = collections.defaultdict(list)
+    for dt in dates: weeks_dict[dt.isocalendar()[1]].append(dt)
+    
+    s = workbook.add_worksheet(dnick)
+    s.write(0, 0, f"{dname} - {month}月 班表確認", fmt_h)
+    cr = 1
+    for w_dates in weeks_dict.values():
+        s.write(cr, 0, "日期", fmt_h); c = 1
+        for dt in w_dates: s.write(cr, c, f"{dt.month}/{dt.day} ({['一','二','三','四','五','六'][dt.weekday()]})", fmt_h); c+=1
+        cr+=1
+        for sh in ["早", "午", "晚"]:
+            s.write(cr, 0, sh, fmt_c); c = 1
+            for dt in w_dates:
+                k = f"{dt}_{sh}"; v = "" 
+                if k in schedule_result and dname in schedule_result[k]["doctors"]: v = "V"
+                s.write(cr, c, v, fmt_c); c+=1
+            cr+=1
+        cr+=1
     writer.close()
     output.seek(0)
     return output
@@ -596,10 +626,10 @@ elif step == "3. 助理進階限制":
 elif step == "4. 醫師範本與生成":
     st.header("醫師班表範本與初始化")
     
-    # 完美雙層日曆 UI 核心邏輯
     doc_names = [d["name"] for d in get_active_doctors()]
     days = ["一", "二", "三", "四", "五", "六"]; shifts = ["早", "午", "晚"]
     
+    # ★ v16.3 完美原生的 MultiIndex
     multi_cols = pd.MultiIndex.from_product([[f"星期{d}" for d in days], shifts])
     
     def get_df(key):
@@ -609,13 +639,16 @@ elif step == "4. 醫師範本與生成":
             sched = data.get(doc, [False]*18)
             if len(sched) != 18: sched = [False]*18
             rows.append(sched)
+        # 完全不使用 column_config，讓 Streamlit 自動渲染 Boolean 為打勾框
         df = pd.DataFrame(rows, index=doc_names, columns=multi_cols)
         return df
 
     def save_df(df, key):
         res = {}
-        for doc in doc_names:
-            res[doc] = [bool(x) for x in df.loc[doc].tolist()]
+        # 安全取值，避開 MultiIndex 字串解析錯誤
+        for row_idx in range(len(df)):
+            doc = doc_names[row_idx]
+            res[doc] = [bool(df.iat[row_idx, col_idx]) for col_idx in range(18)]
         st.session_state.config[key] = res
 
     t1, t2 = st.tabs(["單週範本", "雙週範本"])
@@ -631,8 +664,8 @@ elif step == "4. 醫師範本與生成":
     y = c1.number_input("年", 2025, 2030, st.session_state.config.get("year", 2026))
     m = c2.number_input("月", 1, 12, st.session_state.config.get("month", 4))
     
-    # 單雙週修復邏輯
-    first_week_setting = c3.radio("畫面第 1 週設定為：", ["單週", "雙週"])
+    # 單雙週修復：完全對齊畫面上的週數索引
+    first_week_setting = c3.radio("畫面【第 1 週】設定為：", ["單週", "雙週"])
     is_first_odd = (first_week_setting == "單週")
     
     if st.button("一鍵生成本月初始班表", type="primary"):
@@ -640,14 +673,16 @@ elif step == "4. 醫師範本與生成":
         generated = []
         t_odd = st.session_state.config.get("template_odd", {}); t_even = st.session_state.config.get("template_even", {})
         
-        weeks = get_full_weeks(y, m)
-        for w_idx, w_dates in enumerate(weeks):
+        dates = generate_month_dates(y, m)
+        weeks_dict = collections.defaultdict(list)
+        for dt in dates: weeks_dict[dt.isocalendar()[1]].append(dt)
+        
+        # 依序跑過每週，第一週是 0，第二週是 1... 完全避免 ISO 跨月錯亂
+        for w_idx, w_dates in enumerate(weeks_dict.values()):
             is_odd_week = (w_idx % 2 == 0) if is_first_odd else (w_idx % 2 != 0)
             tmpl = t_odd if is_odd_week else t_even
             
             for dt in w_dates:
-                if dt.month != m: continue # 反黑區不生成
-                if dt.weekday() == 6: continue 
                 base = dt.weekday()*3
                 for s_idx, s in enumerate(["早", "午", "晚"]):
                     idx = base + s_idx
@@ -657,97 +692,97 @@ elif step == "4. 醫師範本與生成":
                             generated.append({"Date": str(dt), "Shift": s, "Doctor": dn})
                             
         st.session_state.config["manual_schedule"] = generated; save_config(st.session_state.config)
-        st.success(f"生成完畢！第 1 週已套用【{first_week_setting}】範本。")
+        st.success(f"生成完畢！畫面第 1 週已精準套用【{first_week_setting}】範本。")
 
 elif step == "5. 👨‍⚕️ 醫師專屬入口":
-    # 節省空間，沿用前版邏輯 (正常運作)
     st.header("👨‍⚕️ 醫師個人班表確認與修改")
     if is_locked_system: st.error("🔒 修改期限已過，目前為唯讀模式。")
-    else: st.info("請選擇名字。若要請假請將勾選取消；若要加診請打勾。反黑區域不可點選。")
+    else: st.info("請選擇名字。若要請假請將勾選取消；若要加診請打勾。")
         
     docs = get_active_doctors(); selected_doc = st.selectbox("📌 選擇醫師", [d["name"] for d in docs])
     y = st.session_state.config.get("year", 2026); m = st.session_state.config.get("month", 4)
-    manual = st.session_state.config.get("manual_schedule", []); weeks = get_full_weeks(y, m)
+    manual = st.session_state.config.get("manual_schedule", [])
+    
+    # ★ 乾淨版面：只取當月的真實日期，廢棄格子直接消失
+    dates = generate_month_dates(y, m)
+    weeks_dict = collections.defaultdict(list)
+    for dt in dates: weeks_dict[dt.isocalendar()[1]].append(dt)
+    
     edited_dfs = {}; col_map = {}
     st.markdown(f"### 📅 {selected_doc} - {m}月 班表")
     
-    for i, w_dates in enumerate(weeks):
-        st.markdown(f"**第 {i+1} 週**")
-        cols = []; disabled_cols = set()
+    for w_idx, w_dates in enumerate(weeks_dict.values()):
+        st.markdown(f"**第 {w_idx+1} 週**")
+        cols = []
         for dt in w_dates:
             wd_str = ['一','二','三','四','五','六'][dt.weekday()]
-            if dt.month == m: disp = f"{dt.month}/{dt.day} ({wd_str})"
-            else: disp = f"⬛ {dt.month}/{dt.day} ({wd_str})"; disabled_cols.add(disp)
-            cols.append(disp); col_map[disp] = (str(dt), dt.month == m)
+            disp = f"{dt.month}/{dt.day} ({wd_str})"
+            cols.append(disp)
+            col_map[disp] = str(dt)
 
         rows = []
         for s in ["早", "午", "晚"]:
             row = {"時段": s}
             for c, dt in zip(cols, w_dates):
-                if c not in disabled_cols: row[c] = any(x for x in manual if x["Date"] == str(dt) and x["Shift"] == s and x["Doctor"] == selected_doc)
-                else: row[c] = "" 
+                row[c] = any(x for x in manual if x["Date"] == str(dt) and x["Shift"] == s and x["Doctor"] == selected_doc)
             rows.append(row)
 
         df = pd.DataFrame(rows).set_index("時段")
-        cfg = {}
-        for c in cols:
-            if c in disabled_cols: cfg[c] = st.column_config.TextColumn(c, disabled=True) 
-            else: cfg[c] = st.column_config.CheckboxColumn(c) 
-        edited_dfs[i] = st.data_editor(df, column_config=cfg, key=f"doc_wk_{i}", use_container_width=True, disabled=is_locked_system)
+        cfg = {c: st.column_config.CheckboxColumn(c) for c in cols}
+        edited_dfs[w_idx] = st.data_editor(df, column_config=cfg, key=f"doc_wk_{w_idx}", use_container_width=True, disabled=is_locked_system)
     
-    if not is_locked_system and st.button("💾 儲存我的班表修改", type="primary"):
-        new_manual = [x for x in manual if x["Doctor"] != selected_doc]
-        for iso, df in edited_dfs.items():
-            for shift, row in df.iterrows():
-                for c in df.columns:
-                    d_str, is_curr_month = col_map[c]
-                    if is_curr_month and row[c] == True: 
-                        new_manual.append({"Date": d_str, "Shift": shift, "Doctor": selected_doc})
-        st.session_state.config["manual_schedule"] = new_manual; save_config(st.session_state.config); st.success(f"✅ {selected_doc} 儲存成功！"); st.rerun()
+    col1, col2 = st.columns(2)
+    with col1:
+        if not is_locked_system and st.button("💾 儲存我的班表修改", type="primary"):
+            new_manual = [x for x in manual if x["Doctor"] != selected_doc]
+            for iso, df in edited_dfs.items():
+                for shift, row in df.iterrows():
+                    for c in df.columns:
+                        if row[c] == True: 
+                            new_manual.append({"Date": col_map[c], "Shift": shift, "Doctor": selected_doc})
+            st.session_state.config["manual_schedule"] = new_manual; save_config(st.session_state.config); st.success(f"✅ {selected_doc} 儲存成功！"); st.rerun()
 
 elif step == "6. 👩‍⚕️ 助理專屬入口":
-    # 節省空間，沿用前版邏輯 (正常運作)
     st.header("👩‍⚕️ 助理個人休假登記")
     if is_locked_system: st.error("🔒 劃假期限已過，目前為唯讀模式。")
-    else: st.info("請選擇名字。在想休假的時段「打勾」。反黑區域不可點選。")
+    else: st.info("請選擇名字。在想休假的時段「打勾」。")
         
     assts = get_active_assistants(); selected_asst = st.selectbox("📌 選擇助理", [a["name"] for a in assts])
     y = st.session_state.config.get("year", 2026); m = st.session_state.config.get("month", 4)
     current_leaves = st.session_state.config.get("leaves", {})
-    weeks = get_full_weeks(y, m); edited_dfs = {}; col_map = {}
+    
+    dates = generate_month_dates(y, m)
+    weeks_dict = collections.defaultdict(list)
+    for dt in dates: weeks_dict[dt.isocalendar()[1]].append(dt)
+    
+    edited_dfs = {}; col_map = {}
     st.markdown(f"### 🌴 {selected_asst} - {m}月 休假表")
     
-    for i, w_dates in enumerate(weeks):
-        st.markdown(f"**第 {i+1} 週**")
-        cols = []; disabled_cols = set()
+    for w_idx, w_dates in enumerate(weeks_dict.values()):
+        st.markdown(f"**第 {w_idx+1} 週**")
+        cols = []
         for dt in w_dates:
             wd_str = ['一','二','三','四','五','六'][dt.weekday()]
-            if dt.month == m: disp = f"{dt.month}/{dt.day} ({wd_str})"
-            else: disp = f"⬛ {dt.month}/{dt.day} ({wd_str})"; disabled_cols.add(disp)
-            cols.append(disp); col_map[disp] = (str(dt), dt.month == m)
+            disp = f"{dt.month}/{dt.day} ({wd_str})"
+            cols.append(disp); col_map[disp] = str(dt)
 
         rows = []
         for s in ["早", "午", "晚"]:
             row = {"時段": s}
             for c, dt in zip(cols, w_dates):
-                if c not in disabled_cols: row[c] = current_leaves.get(f"{selected_asst}_{str(dt)}_{s}", False)
-                else: row[c] = ""
+                row[c] = current_leaves.get(f"{selected_asst}_{str(dt)}_{s}", False)
             rows.append(row)
 
         df = pd.DataFrame(rows).set_index("時段")
-        cfg = {}
-        for c in cols:
-            if c in disabled_cols: cfg[c] = st.column_config.TextColumn(c, disabled=True)
-            else: cfg[c] = st.column_config.CheckboxColumn(c)
-        edited_dfs[i] = st.data_editor(df, column_config=cfg, key=f"asst_wk_{i}", use_container_width=True, disabled=is_locked_system)
+        cfg = {c: st.column_config.CheckboxColumn(c) for c in cols}
+        edited_dfs[w_idx] = st.data_editor(df, column_config=cfg, key=f"asst_wk_{w_idx}", use_container_width=True, disabled=is_locked_system)
     
     if not is_locked_system and st.button("💾 儲存我的休假", type="primary"):
         new_leaves = {k: v for k, v in current_leaves.items() if not k.startswith(f"{selected_asst}_")}
         for iso, df in edited_dfs.items():
             for shift, row in df.iterrows():
                 for c in df.columns:
-                    d_str, is_curr = col_map[c]
-                    if is_curr and row[c] == True: new_leaves[f"{selected_asst}_{d_str}_{shift}"] = True
+                    if row[c] == True: new_leaves[f"{selected_asst}_{col_map[c]}_{shift}"] = True
         st.session_state.config["leaves"] = new_leaves; save_config(st.session_state.config); st.success(f"✅ {selected_asst} 儲存成功！"); st.rerun()
 
 elif step == "7. 排班與總管微調":
@@ -767,7 +802,9 @@ elif step == "7. 排班與總管微調":
         y = st.session_state.config.get("year"); m = st.session_state.config.get("month")
         dates = generate_month_dates(y, m)
         wds = len(dates); std_max = wds*2; std_min = std_max-8
-        weeks = get_full_weeks(y, m)
+        
+        weeks_dict = collections.defaultdict(list)
+        for dt in dates: weeks_dict[dt.isocalendar()[1]].append(dt)
         
         edited_res = st.session_state.result.copy()
         docs = get_active_doctors(); assts = get_active_assistants()
@@ -775,29 +812,27 @@ elif step == "7. 排班與總管微調":
         n2nm = {a["nick"]: a["name"] for a in assts}; nm2n = {a["name"]: a["nick"] for a in assts}
         
         with col_ed:
-            st.subheader("📝 班表微調區 (雙層日曆)")
-            for i, w_dates in enumerate(weeks):
-                st.markdown(f"**第 {i+1} 週**")
-                multi_cols = []; cmap = {}; disabled_cols = set()
+            st.subheader("📝 班表微調區 (原生雙層日曆)")
+            for w_idx, w_dates in enumerate(weeks_dict.values()):
+                st.markdown(f"**第 {w_idx+1} 週**")
                 
-                # 建立雙層表頭 Tuple
+                # 建立原生的 MultiIndex Tuple
+                multi_cols = []
+                cmap = {}
                 for dt in w_dates:
-                    is_curr = (dt.month == m); wd_str = ['一','二','三','四','五','六'][dt.weekday()]
-                    if is_curr: disp_date = f"{dt.month}/{dt.day} ({wd_str})"
-                    else: 
-                        disp_date = f"⬛ {dt.month}/{dt.day} ({wd_str})"
-                        disabled_cols.add(disp_date)
+                    wd_str = ['一','二','三','四','五','六'][dt.weekday()]
+                    disp_date = f"{dt.month}/{dt.day} ({wd_str})"
                     for s in ["早", "午", "晚"]:
                         c_tuple = (disp_date, s)
                         multi_cols.append(c_tuple)
-                        cmap[c_tuple] = (f"{dt}_{s}", is_curr)
+                        cmap[c_tuple] = f"{dt}_{s}"
                         
                 rows = []
                 for doc in docs:
                     r = []
                     for c_tuple in multi_cols:
-                        k, is_curr = cmap[c_tuple]
-                        if is_curr and k in edited_res: r.append(nm2n.get(edited_res[k]["doctors"].get(doc["name"], ""), ""))
+                        k = cmap[c_tuple]
+                        if k in edited_res: r.append(nm2n.get(edited_res[k]["doctors"].get(doc["name"], ""), ""))
                         else: r.append("")
                     rows.append(r)
                     
@@ -805,8 +840,8 @@ elif step == "7. 排班與總管微調":
                 for rn, rk, ri in r_defs:
                     r = []
                     for c_tuple in multi_cols:
-                        k, is_curr = cmap[c_tuple]
-                        if is_curr and k in edited_res:
+                        k = cmap[c_tuple]
+                        if k in edited_res:
                             lst = edited_res[k].get(rk, [])
                             if ri < len(lst): r.append(nm2n.get(lst[ri], ""))
                             else: r.append("")
@@ -815,29 +850,25 @@ elif step == "7. 排班與總管微調":
                     
                 idx_names = [f"👨‍⚕️{d['nick']}" for d in docs] + [r[0] for r in r_defs]
                 
-                # 完美的降維打擊：使用 Categorical 取代 column_config 來生成下拉選單
+                # 完美降維打法：使用 pd.Categorical 自動產生下拉選單，完全捨棄報錯的 column_config
                 dfw = pd.DataFrame(rows, index=idx_names, columns=pd.MultiIndex.from_tuples(multi_cols))
                 for c_tuple in multi_cols:
-                    if c_tuple[0] in disabled_cols:
-                        dfw[c_tuple] = "⬛" # 反黑，變成唯讀字串
-                    else:
-                        dfw[c_tuple] = pd.Categorical(dfw[c_tuple], categories=asst_opts) # 自動轉為下拉選單
+                    dfw[c_tuple] = pd.Categorical(dfw[c_tuple], categories=asst_opts)
                 
-                # 捨棄 config，直接畫出純淨雙層表！
-                edw = st.data_editor(dfw, use_container_width=True, key=f"mw_{i}")
+                edw = st.data_editor(dfw, use_container_width=True, key=f"mw_{w_idx}")
                 
-                # 穩定的 .iat 取值法 (防止 Tuple KeyError)
+                # 安全回存機制：使用 .iat 座標取值，完全免疫 KeyError
                 for row_idx in range(len(edw)):
                     idx_str = str(edw.index[row_idx])
                     is_doc = "👨‍⚕️" in idx_str
                     doc_name = next((d["name"] for d in docs if d["nick"]==idx_str.replace("👨‍⚕️","")), "")
                     
                     for col_idx, c_tuple in enumerate(multi_cols):
-                        k, is_curr = cmap[c_tuple]
-                        if not is_curr or k not in edited_res: continue
+                        k = cmap[c_tuple]
+                        if k not in edited_res: continue
                         
                         v_nick = edw.iat[row_idx, col_idx]
-                        if pd.isna(v_nick) or v_nick == "⬛": v_name = ""
+                        if pd.isna(v_nick): v_name = ""
                         else: v_name = n2nm.get(v_nick, "")
                         
                         if is_doc: edited_res[k]["doctors"][doc_name] = v_name
@@ -847,7 +878,6 @@ elif step == "7. 排班與總管微調":
                                     if rk not in edited_res[k]: edited_res[k][rk] = []
                                     while len(edited_res[k][rk]) <= ri: edited_res[k][rk].append("")
                                     edited_res[k][rk][ri] = v_name
-                                    
             if st.button("💾 儲存並更新數據", type="primary"):
                 st.session_state.result = edited_res; st.rerun()
 
@@ -874,7 +904,8 @@ elif step == "7. 排班與總管微調":
                         sat_stats[nm]["worked_days"] += 1
                         if "晚" in shifts: sat_stats[nm]["nights"] += 1
                         else: sat_stats[nm]["no_night_worked"] += 1
-                    else: sat_stats[nm]["full_off"] += 1
+                    else:
+                        sat_stats[nm]["full_off"] += 1
 
             for a in assts:
                 nm = a["name"]; c_val = curr_counts[nm]
